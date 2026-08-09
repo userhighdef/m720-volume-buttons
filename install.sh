@@ -55,7 +55,10 @@ install -m 0644 "$plist_build" "$service_plist"
 if launchctl print "$service_domain/$service_label" >/dev/null 2>&1; then
     launchctl bootout "$service_domain/$service_label" || true
 fi
-launchctl bootstrap "$service_domain" "$service_plist"
+if ! launchctl bootstrap "$service_domain" "$service_plist" 2>/dev/null; then
+    sleep 1
+    launchctl bootstrap "$service_domain" "$service_plist"
+fi
 launchctl kickstart -k "$service_domain/$service_label"
 
 open "$support_dir"

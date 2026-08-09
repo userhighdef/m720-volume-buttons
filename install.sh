@@ -45,7 +45,8 @@ install -m 0755 "$program_build" "$program"
 codesign --force --sign - "$program"
 
 cp "$repo_dir/launchagent/local.m720.volume-buttons.plist.in" "$plist_build"
-plutil -replace ProgramArguments.0 -string "$program" "$plist_build"
+plutil -remove ProgramArguments.0 "$plist_build"
+plutil -insert ProgramArguments.0 -string "$program" "$plist_build"
 plutil -replace StandardOutPath -string "$stdout_log" "$plist_build"
 plutil -replace StandardErrorPath -string "$stderr_log" "$plist_build"
 plutil -lint "$plist_build" >/dev/null

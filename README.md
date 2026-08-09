@@ -9,7 +9,7 @@ It runs as a per-user macOS LaunchAgent, starts automatically at login, and keep
 
 ## Device scope
 
-The event tap checks the physical HID sender and only intercepts events from Logitech M720 devices with `VID:PID 046d:b015`. Side buttons on other mice are left unchanged.
+The remapper activates only while a Logitech M720 with `VID:PID 046d:b015` is connected. macOS does not retain a physical sender ID on the M720's button 3/4 `CGEvent`s, so while the M720 is connected those two global side-button numbers are remapped. If you use a second mouse at the same time, its Back and Forward buttons will therefore receive the same mapping.
 
 ## Requirements
 
@@ -71,7 +71,7 @@ Afterward, remove `m720-volume-buttons` from Accessibility manually.
 
 ## Implementation
 
-The daemon uses a `CGEventTap` at the HID level, resolves the originating device through the event's `IOHIDEvent` sender ID, suppresses only M720 button 3/4 events, and posts native macOS system-defined volume-key events. It checks Accessibility permission every 500 ms and tears down the tap if permission is revoked.
+The daemon uses a `CGEventTap` at the HID level, confirms through IOKit that an M720 is connected, suppresses button 3/4 events, and posts native macOS system-defined volume-key events. It checks Accessibility permission every 500 ms and tears down the tap if permission is revoked.
 
 ## License
 

@@ -2,6 +2,8 @@
 #import <ApplicationServices/ApplicationServices.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <IOKit/IOKitLib.h>
+#import <IOKit/hid/IOHIDDeviceKeys.h>
+#import <IOKit/hid/IOHIDKeys.h>
 
 #include <signal.h>
 #include <stdbool.h>
@@ -30,11 +32,6 @@ static CFMachPortRef active_tap = NULL;
 static bool captured_back_down = false;
 static bool captured_forward_down = false;
 
-// These long-standing CoreGraphics/IOKit symbols expose the HID sender behind
-// a CGEvent. They let the remapper target only the M720 instead of every mouse.
-extern CFTypeRef CGEventCopyIOHIDEvent(CGEventRef event);
-extern uint64_t IOHIDEventGetSenderID(CFTypeRef event);
-
 static void handle_signal(int signal_number) {
     (void)signal_number;
     keep_running = 0;
@@ -51,56 +48,40 @@ static void request_accessibility(void) {
     (void)AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
 }
 
-static bool read_int_property(io_service_t service, CFStringRef key, int64_t *result) {
-    CFTypeRef value = IORegistryEntrySearchCFProperty(
-        service,
-        kIOServicePlane,
-        key,
-        kCFAllocatorDefault,
-        kIORegistryIterateRecursively | kIORegistryIterateParents);
-    if (value == NULL) {
-        return false;
-    }
-
-    bool found = false;
-    if (CFGetTypeID(value) == CFNumberGetTypeID()) {
-        found = CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, result);
-    }
-    CFRelease(value);
-    return found;
-}
-
-static bool event_is_from_m720(CGEventRef event) {
-    CFTypeRef hid_event = CGEventCopyIOHIDEvent(event);
-    if (hid_event == NULL) {
-        return false;
-    }
-    uint64_t sender_id = IOHIDEventGetSenderID(hid_event);
-    CFRelease(hid_event);
-    if (sender_id == 0) {
-        return false;
-    }
-
-    CFMutableDictionaryRef matching = IORegistryEntryIDMatching(sender_id);
+static bool m720_is_connected(void) {
+    CFMutableDictionaryRef matching = IOServiceMatching(kIOHIDDeviceKey);
     if (matching == NULL) {
         return false;
     }
+
+    int32_t vendor_id = (int32_t)M720_VENDOR_ID;
+    int32_t product_id = (int32_t)M720_PRODUCT_ID;
+    CFNumberRef vendor = CFNumberCreate(
+        kCFAllocatorDefault,
+        kCFNumberSInt32Type,
+        &vendor_id);
+    CFNumberRef product = CFNumberCreate(
+        kCFAllocatorDefault,
+        kCFNumberSInt32Type,
+        &product_id);
+    if (vendor == NULL || product == NULL) {
+        if (vendor != NULL) CFRelease(vendor);
+        if (product != NULL) CFRelease(product);
+        CFRelease(matching);
+        return false;
+    }
+    CFDictionarySetValue(matching, CFSTR(kIOHIDVendorIDKey), vendor);
+    CFDictionarySetValue(matching, CFSTR(kIOHIDProductIDKey), product);
+    CFRelease(vendor);
+    CFRelease(product);
+
+    // IOServiceGetMatchingService consumes the matching dictionary.
     io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
     if (service == IO_OBJECT_NULL) {
         return false;
     }
-
-    int64_t vendor_id = -1;
-    int64_t product_id = -1;
-    bool found_vendor = read_int_property(service, CFSTR("VendorID"), &vendor_id)
-        || read_int_property(service, CFSTR("idVendor"), &vendor_id);
-    bool found_product = read_int_property(service, CFSTR("ProductID"), &product_id)
-        || read_int_property(service, CFSTR("idProduct"), &product_id);
     IOObjectRelease(service);
-
-    return found_vendor && found_product
-        && vendor_id == M720_VENDOR_ID
-        && product_id == M720_PRODUCT_ID;
+    return true;
 }
 
 static void post_media_key(int32_t key_type) {
@@ -160,7 +141,9 @@ static CGEventRef event_callback(
         *captured_down = false;
         return NULL;
     }
-    if (!event_is_from_m720(event)) {
+    // macOS does not retain an IOHID sender ID on M720 button 3/4 CGEvents.
+    // Gate the global button numbers on the physical M720 being connected.
+    if (!m720_is_connected()) {
         return event;
     }
 
@@ -234,8 +217,11 @@ int main(int argc, const char *argv[]) {
         return 64;
     }
     if (argc == 2 && strcmp(argv[1], "--check") == 0) {
-        fprintf(stdout, "Accessibility: %s\n", accessibility_is_granted() ? "granted" : "not granted");
-        return accessibility_is_granted() ? 0 : 1;
+        bool accessibility = accessibility_is_granted();
+        bool connected = m720_is_connected();
+        fprintf(stdout, "Accessibility: %s\n", accessibility ? "granted" : "not granted");
+        fprintf(stdout, "M720 (046d:b015): %s\n", connected ? "connected" : "not connected");
+        return accessibility && connected ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--request-permission") == 0) {
         request_accessibility();

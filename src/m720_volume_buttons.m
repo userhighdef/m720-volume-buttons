@@ -7,6 +7,7 @@
 
 #include <signal.h>
 #include <stdbool.h>
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,10 +28,32 @@ static const int32_t NX_SUBTYPE_AUX_CONTROL_BUTTONS_VALUE = 8;
 static const int32_t NX_KEY_DOWN_VALUE = 0x0a;
 static const int32_t NX_KEY_UP_VALUE = 0x0b;
 
+// macOS symbolic hotkey IDs for Mission Control's Space navigation actions.
+static const uint32_t SPACE_LEFT_HOTKEY = 79;
+static const uint32_t SPACE_RIGHT_HOTKEY = 81;
+
 static volatile sig_atomic_t keep_running = 1;
 static CFMachPortRef active_tap = NULL;
 static bool captured_back_down = false;
 static bool captured_forward_down = false;
+
+typedef int32_t (*CgsGetSymbolicHotKeyValueFn)(
+    uint32_t hotkey,
+    uint16_t *key_equivalent,
+    uint16_t *virtual_key,
+    uint32_t *modifiers);
+typedef bool (*CgsIsSymbolicHotKeyEnabledFn)(uint32_t hotkey);
+typedef int32_t (*CgsSetSymbolicHotKeyEnabledFn)(uint32_t hotkey, bool enabled);
+
+typedef struct {
+    CgsGetSymbolicHotKeyValueFn get_value;
+    CgsIsSymbolicHotKeyEnabledFn is_enabled;
+    CgsSetSymbolicHotKeyEnabledFn set_enabled;
+} CgsHotkeyApi;
+
+static bool cgs_api_attempted = false;
+static void *application_services_handle = NULL;
+static CgsHotkeyApi cgs_api = {0};
 
 // Unlike M720 button events, scroll events retain their physical HID sender.
 extern CFTypeRef CGEventCopyIOHIDEvent(CGEventRef event);
@@ -176,30 +199,106 @@ static void post_media_key(int32_t key_type) {
     }
 }
 
-static void post_control_arrow(CGKeyCode key_code) {
-    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
-    if (source == NULL) {
-        fprintf(stderr, "m720-volume-buttons: could not create keyboard event source\n");
-        return;
+static bool load_cgs_hotkey_api(void) {
+    if (cgs_api_attempted) {
+        return cgs_api.get_value != NULL
+            && cgs_api.is_enabled != NULL
+            && cgs_api.set_enabled != NULL;
+    }
+    cgs_api_attempted = true;
+
+    application_services_handle = dlopen(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices",
+        RTLD_LAZY | RTLD_LOCAL);
+    if (application_services_handle == NULL) {
+        fprintf(stderr, "m720-volume-buttons: could not open ApplicationServices\n");
+        return false;
     }
 
-    CGEventRef down = CGEventCreateKeyboardEvent(source, key_code, true);
-    CGEventRef up = CGEventCreateKeyboardEvent(source, key_code, false);
+    cgs_api.get_value = (CgsGetSymbolicHotKeyValueFn)dlsym(
+        application_services_handle,
+        "CGSGetSymbolicHotKeyValue");
+    cgs_api.is_enabled = (CgsIsSymbolicHotKeyEnabledFn)dlsym(
+        application_services_handle,
+        "CGSIsSymbolicHotKeyEnabled");
+    cgs_api.set_enabled = (CgsSetSymbolicHotKeyEnabledFn)dlsym(
+        application_services_handle,
+        "CGSSetSymbolicHotKeyEnabled");
+    if (cgs_api.get_value == NULL
+        || cgs_api.is_enabled == NULL
+        || cgs_api.set_enabled == NULL) {
+        fprintf(stderr, "m720-volume-buttons: CGS symbolic hotkey API unavailable\n");
+        return false;
+    }
+    return true;
+}
+
+static bool post_symbolic_hotkey(uint32_t hotkey) {
+    if (!load_cgs_hotkey_api()) {
+        return false;
+    }
+    CgsHotkeyApi api = cgs_api;
+    if (api.get_value == NULL || api.is_enabled == NULL || api.set_enabled == NULL) {
+        return false;
+    }
+
+    uint16_t key_equivalent = 0;
+    uint16_t virtual_key = 0;
+    uint32_t modifiers = 0;
+    int32_t error = api.get_value(
+        hotkey,
+        &key_equivalent,
+        &virtual_key,
+        &modifiers);
+    if (error != 0) {
+        fprintf(
+            stderr,
+            "m720-volume-buttons: CGSGetSymbolicHotKeyValue(%u) failed: %d\n",
+            hotkey,
+            error);
+        return false;
+    }
+
+    bool was_enabled = api.is_enabled(hotkey);
+    if (!was_enabled && api.set_enabled(hotkey, true) != 0) {
+        fprintf(stderr, "m720-volume-buttons: could not enable symbolic hotkey %u\n", hotkey);
+        return false;
+    }
+
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    if (source == NULL) {
+        fprintf(stderr, "m720-volume-buttons: could not create symbolic hotkey source\n");
+        if (!was_enabled) {
+            (void)api.set_enabled(hotkey, false);
+        }
+        return false;
+    }
+
+    CGEventRef down = CGEventCreateKeyboardEvent(source, virtual_key, true);
+    CGEventRef up = CGEventCreateKeyboardEvent(source, virtual_key, false);
     if (down == NULL || up == NULL) {
-        fprintf(stderr, "m720-volume-buttons: could not create desktop-switch event\n");
+        fprintf(stderr, "m720-volume-buttons: could not create symbolic hotkey event\n");
         if (down != NULL) CFRelease(down);
         if (up != NULL) CFRelease(up);
         CFRelease(source);
-        return;
+        if (!was_enabled) {
+            (void)api.set_enabled(hotkey, false);
+        }
+        return false;
     }
 
-    CGEventSetFlags(down, kCGEventFlagMaskControl);
-    CGEventSetFlags(up, kCGEventFlagMaskControl);
-    CGEventPost(kCGHIDEventTap, down);
-    CGEventPost(kCGHIDEventTap, up);
+    CGEventSetFlags(down, (CGEventFlags)modifiers);
+    CGEventSetFlags(up, (CGEventFlags)modifiers);
+    CGEventPost(kCGSessionEventTap, down);
+    CGEventPost(kCGSessionEventTap, up);
     CFRelease(down);
     CFRelease(up);
     CFRelease(source);
+
+    if (!was_enabled && api.set_enabled(hotkey, false) != 0) {
+        fprintf(stderr, "m720-volume-buttons: could not restore symbolic hotkey %u\n", hotkey);
+    }
+    return true;
 }
 
 static CGEventRef event_callback(
@@ -226,11 +325,13 @@ static CGEventRef event_callback(
 
         // Actual M720 events on this Mac: tilt-left = -1, tilt-right = +1.
         if (horizontal < 0.0) {
-            post_control_arrow(0x7b); // kVK_LeftArrow
-            fprintf(stdout, "m720-volume-buttons: Wheel Left -> Previous Desktop\n");
+            if (post_symbolic_hotkey(SPACE_LEFT_HOTKEY)) {
+                fprintf(stdout, "m720-volume-buttons: Wheel Left -> Previous Desktop\n");
+            }
         } else {
-            post_control_arrow(0x7c); // kVK_RightArrow
-            fprintf(stdout, "m720-volume-buttons: Wheel Right -> Next Desktop\n");
+            if (post_symbolic_hotkey(SPACE_RIGHT_HOTKEY)) {
+                fprintf(stdout, "m720-volume-buttons: Wheel Right -> Next Desktop\n");
+            }
         }
         return NULL;
     }
@@ -351,12 +452,10 @@ int main(int argc, const char *argv[]) {
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--previous-desktop") == 0) {
-        post_control_arrow(0x7b);
-        return 0;
+        return post_symbolic_hotkey(SPACE_LEFT_HOTKEY) ? 0 : 1;
     }
     if (argc == 2 && strcmp(argv[1], "--next-desktop") == 0) {
-        post_control_arrow(0x7c);
-        return 0;
+        return post_symbolic_hotkey(SPACE_RIGHT_HOTKEY) ? 0 : 1;
     }
     if (argc == 2) {
         print_usage(argv[0]);

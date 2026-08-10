@@ -4,8 +4,8 @@ A small standalone remapper for the Logitech M720 Triathlon:
 
 - **Forward** → **Volume Up**
 - **Back** → **Volume Down**
-- **Wheel tilt left** → **Previous Desktop** (`Control` + `Left Arrow`)
-- **Wheel tilt right** → **Next Desktop** (`Control` + `Right Arrow`)
+- **Wheel tilt left** → **Previous Desktop** (the system's **Move left a space** shortcut)
+- **Wheel tilt right** → **Next Desktop** (the system's **Move right a space** shortcut)
 
 It runs as a per-user macOS LaunchAgent, starts automatically at login, and keeps working after sleep or Bluetooth reconnection. Logi Options+ and OpenLogi are not runtime dependencies.
 
@@ -66,7 +66,7 @@ Test desktop switching directly:
 ~/Library/Application\ Support/M720VolumeButtons/m720-volume-buttons --next-desktop
 ```
 
-The standard macOS **Move left a space** and **Move right a space** shortcuts must be enabled in **System Settings > Keyboard > Keyboard Shortcuts > Mission Control**.
+The remapper reads the current macOS **Move left a space** and **Move right a space** symbolic hotkeys, so custom shortcut assignments are respected. If either shortcut is disabled, it is enabled only for the synthetic key event and then restored to its prior state.
 
 ## Using it alongside OpenLogi
 
@@ -82,7 +82,7 @@ Afterward, remove `m720-volume-buttons` from Accessibility manually.
 
 ## Implementation
 
-The daemon uses a `CGEventTap` at the HID level, confirms device identity through IOKit, suppresses the mapped button and horizontal-wheel events, and posts native macOS volume keys or `Control` + arrow shortcuts. Vertical wheel events pass through unchanged. It checks Accessibility permission every 500 ms and tears down the tap if permission is revoked.
+The daemon uses a `CGEventTap` at the HID level, confirms device identity through IOKit, suppresses the mapped button and horizontal-wheel events, and posts native macOS volume keys or the configured Mission Control symbolic hotkeys. Vertical wheel events pass through unchanged. It checks Accessibility permission every 500 ms and tears down the tap if permission is revoked.
 
 ## License
 

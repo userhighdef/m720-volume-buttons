@@ -4,12 +4,14 @@ A small standalone remapper for the Logitech M720 Triathlon:
 
 - **Forward** → **Volume Up**
 - **Back** → **Volume Down**
+- **Wheel tilt left** → **Previous Desktop** (`Control` + `Left Arrow`)
+- **Wheel tilt right** → **Next Desktop** (`Control` + `Right Arrow`)
 
 It runs as a per-user macOS LaunchAgent, starts automatically at login, and keeps working after sleep or Bluetooth reconnection. Logi Options+ and OpenLogi are not runtime dependencies.
 
 ## Device scope
 
-The remapper activates only while a Logitech M720 with `VID:PID 046d:b015` is connected. macOS does not retain a physical sender ID on the M720's button 3/4 `CGEvent`s, so while the M720 is connected those two global side-button numbers are remapped. If you use a second mouse at the same time, its Back and Forward buttons will therefore receive the same mapping.
+The remapper activates only while a Logitech M720 with `VID:PID 046d:b015` is connected. Horizontal wheel events retain their HID sender, so desktop switching is limited precisely to the M720. macOS does not retain a physical sender ID on the M720's button 3/4 `CGEvent`s, so while the M720 is connected those two global side-button numbers are remapped. If you use a second mouse at the same time, its Back and Forward buttons will therefore receive the same mapping.
 
 ## Requirements
 
@@ -57,6 +59,15 @@ You can also test media-key injection directly:
 ~/Library/Application\ Support/M720VolumeButtons/m720-volume-buttons --volume-down
 ```
 
+Test desktop switching directly:
+
+```sh
+~/Library/Application\ Support/M720VolumeButtons/m720-volume-buttons --previous-desktop
+~/Library/Application\ Support/M720VolumeButtons/m720-volume-buttons --next-desktop
+```
+
+The standard macOS **Move left a space** and **Move right a space** shortcuts must be enabled in **System Settings > Keyboard > Keyboard Shortcuts > Mission Control**.
+
 ## Using it alongside OpenLogi
 
 This tool does not require OpenLogi. If OpenLogi's mouse-event agent is also running, avoid maintaining different assignments for the M720 Back and Forward buttons in both tools; two active remappers can otherwise make the result depend on event-tap ordering.
@@ -71,7 +82,7 @@ Afterward, remove `m720-volume-buttons` from Accessibility manually.
 
 ## Implementation
 
-The daemon uses a `CGEventTap` at the HID level, confirms through IOKit that an M720 is connected, suppresses button 3/4 events, and posts native macOS system-defined volume-key events. It checks Accessibility permission every 500 ms and tears down the tap if permission is revoked.
+The daemon uses a `CGEventTap` at the HID level, confirms device identity through IOKit, suppresses the mapped button and horizontal-wheel events, and posts native macOS volume keys or `Control` + arrow shortcuts. Vertical wheel events pass through unchanged. It checks Accessibility permission every 500 ms and tears down the tap if permission is revoked.
 
 ## License
 

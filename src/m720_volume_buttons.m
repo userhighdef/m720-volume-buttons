@@ -32,6 +32,10 @@ static CFMachPortRef active_tap = NULL;
 static bool captured_back_down = false;
 static bool captured_forward_down = false;
 
+// Unlike M720 button events, scroll events retain their physical HID sender.
+extern CFTypeRef CGEventCopyIOHIDEvent(CGEventRef event);
+extern uint64_t IOHIDEventGetSenderID(CFTypeRef event);
+
 static void handle_signal(int signal_number) {
     (void)signal_number;
     keep_running = 0;
@@ -84,6 +88,70 @@ static bool m720_is_connected(void) {
     return true;
 }
 
+static bool read_int_property(io_service_t service, CFStringRef key, int64_t *result) {
+    CFTypeRef value = IORegistryEntrySearchCFProperty(
+        service,
+        kIOServicePlane,
+        key,
+        kCFAllocatorDefault,
+        kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (value == NULL) {
+        return false;
+    }
+
+    bool found = false;
+    if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+        found = CFNumberGetValue((CFNumberRef)value, kCFNumberSInt64Type, result);
+    }
+    CFRelease(value);
+    return found;
+}
+
+static bool scroll_event_is_from_m720(CGEventRef event) {
+    CFTypeRef hid_event = CGEventCopyIOHIDEvent(event);
+    if (hid_event == NULL) {
+        return false;
+    }
+    uint64_t sender_id = IOHIDEventGetSenderID(hid_event);
+    CFRelease(hid_event);
+    if (sender_id == 0) {
+        return false;
+    }
+
+    CFMutableDictionaryRef matching = IORegistryEntryIDMatching(sender_id);
+    if (matching == NULL) {
+        return false;
+    }
+    io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
+    if (service == IO_OBJECT_NULL) {
+        return false;
+    }
+
+    int64_t vendor_id = -1;
+    int64_t product_id = -1;
+    bool found_vendor = read_int_property(service, CFSTR("VendorID"), &vendor_id)
+        || read_int_property(service, CFSTR("idVendor"), &vendor_id);
+    bool found_product = read_int_property(service, CFSTR("ProductID"), &product_id)
+        || read_int_property(service, CFSTR("idProduct"), &product_id);
+    IOObjectRelease(service);
+
+    return found_vendor && found_product
+        && vendor_id == M720_VENDOR_ID
+        && product_id == M720_PRODUCT_ID;
+}
+
+static double horizontal_scroll_delta(CGEventRef event) {
+    double point = CGEventGetDoubleValueField(event, kCGScrollWheelEventPointDeltaAxis2);
+    if (point != 0.0) {
+        return point;
+    }
+    double fixed = CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2);
+    if (fixed != 0.0) {
+        return fixed;
+    }
+    return (double)CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+}
+
 static void post_media_key(int32_t key_type) {
     @autoreleasepool {
         const int32_t states[] = {NX_KEY_DOWN_VALUE, NX_KEY_UP_VALUE};
@@ -108,6 +176,32 @@ static void post_media_key(int32_t key_type) {
     }
 }
 
+static void post_control_arrow(CGKeyCode key_code) {
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    if (source == NULL) {
+        fprintf(stderr, "m720-volume-buttons: could not create keyboard event source\n");
+        return;
+    }
+
+    CGEventRef down = CGEventCreateKeyboardEvent(source, key_code, true);
+    CGEventRef up = CGEventCreateKeyboardEvent(source, key_code, false);
+    if (down == NULL || up == NULL) {
+        fprintf(stderr, "m720-volume-buttons: could not create desktop-switch event\n");
+        if (down != NULL) CFRelease(down);
+        if (up != NULL) CFRelease(up);
+        CFRelease(source);
+        return;
+    }
+
+    CGEventSetFlags(down, kCGEventFlagMaskControl);
+    CGEventSetFlags(up, kCGEventFlagMaskControl);
+    CGEventPost(kCGHIDEventTap, down);
+    CGEventPost(kCGHIDEventTap, up);
+    CFRelease(down);
+    CFRelease(up);
+    CFRelease(source);
+}
+
 static CGEventRef event_callback(
     CGEventTapProxy proxy,
     CGEventType type,
@@ -122,6 +216,23 @@ static CGEventRef event_callback(
             fprintf(stderr, "m720-volume-buttons: event tap re-enabled\n");
         }
         return event;
+    }
+
+    if (type == kCGEventScrollWheel) {
+        double horizontal = horizontal_scroll_delta(event);
+        if (horizontal == 0.0 || !scroll_event_is_from_m720(event)) {
+            return event;
+        }
+
+        // Actual M720 events on this Mac: tilt-left = -1, tilt-right = +1.
+        if (horizontal < 0.0) {
+            post_control_arrow(0x7b); // kVK_LeftArrow
+            fprintf(stdout, "m720-volume-buttons: Wheel Left -> Previous Desktop\n");
+        } else {
+            post_control_arrow(0x7c); // kVK_RightArrow
+            fprintf(stdout, "m720-volume-buttons: Wheel Right -> Next Desktop\n");
+        }
+        return NULL;
     }
 
     if (type != kCGEventOtherMouseDown && type != kCGEventOtherMouseUp) {
@@ -162,7 +273,8 @@ static CGEventRef event_callback(
 
 static int run_event_tap(void) {
     CGEventMask mask = CGEventMaskBit(kCGEventOtherMouseDown)
-        | CGEventMaskBit(kCGEventOtherMouseUp);
+        | CGEventMaskBit(kCGEventOtherMouseUp)
+        | CGEventMaskBit(kCGEventScrollWheel);
     active_tap = CGEventTapCreate(
         kCGHIDEventTap,
         kCGHeadInsertEventTap,
@@ -205,7 +317,10 @@ static int run_event_tap(void) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stdout, "Usage: %s [--check | --request-permission | --volume-up | --volume-down]\n", program);
+    fprintf(
+        stdout,
+        "Usage: %s [--check | --request-permission | --volume-up | --volume-down | --previous-desktop | --next-desktop]\n",
+        program);
 }
 
 int main(int argc, const char *argv[]) {
@@ -233,6 +348,14 @@ int main(int argc, const char *argv[]) {
     }
     if (argc == 2 && strcmp(argv[1], "--volume-down") == 0) {
         post_media_key(NX_KEYTYPE_SOUND_DOWN_VALUE);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--previous-desktop") == 0) {
+        post_control_arrow(0x7b);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--next-desktop") == 0) {
+        post_control_arrow(0x7c);
         return 0;
     }
     if (argc == 2) {
